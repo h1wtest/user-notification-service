@@ -9,16 +9,18 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"log/slog"
 	"platform-contracts/gen/go/events"
+	"platform-contracts/gen/go/eventsv2"
 	"time"
 )
 
 var ErrPoison = errors.New("invalid_event")
 
 type Consumer struct {
-	DB     *pgxpool.Pool
-	Config Config
-	Kafka  *kgo.Client
-	Apply  func(context.Context, Envelope) error
+	DB      *pgxpool.Pool
+	Config  Config
+	Kafka   *kgo.Client
+	Apply   func(context.Context, Envelope) error
+	ApplyV2 func(context.Context, eventsv2.Envelope) error
 }
 
 func NewConsumer(db *pgxpool.Pool, c Config, group string, topics []string, apply func(context.Context, Envelope) error) (*Consumer, error) {
@@ -32,7 +34,7 @@ func NewConsumer(db *pgxpool.Pool, c Config, group string, topics []string, appl
 	if err != nil {
 		return nil, err
 	}
-	return &Consumer{db, c, k, apply}, nil
+	return &Consumer{DB: db, Config: c, Kafka: k, Apply: apply}, nil
 }
 func Quarantine(ctx context.Context, db *pgxpool.Pool, c Config, topic string, partition int32, offset int64, raw []byte, reason string) error {
 	aad := fmt.Sprintf("%s:%d:%d", topic, partition, offset)
@@ -59,6 +61,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 	defer func() { c.Kafka.AllowRebalance(); c.Kafka.Close() }()
 	relayDone := make(chan struct{})
 	go func() { defer close(relayDone); c.relayDLQ(ctx) }()
+	ownerRelayDone := make(chan struct{})
+	go func() { defer close(ownerRelayDone); c.relayOwnerOutbox(ctx) }()
+	defer func() { <-ownerRelayDone }()
 	defer func() { <-relayDone }()
 	for ctx.Err() == nil {
 		fetches := c.Kafka.PollRecords(ctx, 1)
@@ -113,12 +118,28 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 func (c *Consumer) processRecord(ctx context.Context, record *kgo.Record) error {
+	var version struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if json.Unmarshal(record.Value, &version) == nil && version.SchemaVersion == 2 {
+		var e eventsv2.Envelope
+		if json.Unmarshal(record.Value, &e) != nil || e.Validate() != nil || e.Topic() != record.Topic || string(record.Key) != e.AggregateID || c.ApplyV2 == nil {
+			return Quarantine(ctx, c.DB, c.Config, record.Topic, record.Partition, record.Offset, record.Value, "invalid_event")
+		}
+		spanCtx, _, finish := StartSpan(ctx, e.Traceparent, "kafka.process "+e.EventType)
+		err := c.ApplyV2(spanCtx, e)
+		finish(err != nil)
+		if errors.Is(err, ErrPoison) {
+			return Quarantine(ctx, c.DB, c.Config, record.Topic, record.Partition, record.Offset, record.Value, "invalid_event")
+		}
+		return err
+	}
 	var event Envelope
 	if err := json.Unmarshal(record.Value, &event); err != nil {
 		return Quarantine(ctx, c.DB, c.Config, record.Topic, record.Partition, record.Offset, record.Value, "invalid_envelope")
 	}
 	expected, err := events.Topic(event.EventType)
-	if err != nil || expected != record.Topic {
+	if err != nil || expected != record.Topic || Validate(event) != nil || string(record.Key) != event.AggregateID {
 		return Quarantine(ctx, c.DB, c.Config, record.Topic, record.Partition, record.Offset, record.Value, "invalid_event")
 	}
 	spanCtx, _, finish := StartSpan(ctx, event.Traceparent, "kafka.process "+event.EventType)
@@ -153,7 +174,7 @@ func (c *Consumer) relayDLQ(ctx context.Context) {
 		// so sensitive command contents never appear in shared diagnostics.
 		b, _ := json.Marshal(map[string]any{"id": id, "topic": topic, "partition": partition, "offset": offset, "reason": reason})
 		timeout, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err = c.Kafka.ProduceSync(timeout, &kgo.Record{Topic: "platform.dlq.v1", Key: []byte(id), Value: b}).FirstErr()
+		err = c.Kafka.ProduceSync(timeout, &kgo.Record{Topic: "platform.dlq.v2", Key: []byte(id), Value: b}).FirstErr()
 		cancel()
 		if err == nil {
 			_, err = tx.Exec(ctx, "UPDATE dlq_outbox SET published_at=now() WHERE id=$1", id)

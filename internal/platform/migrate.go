@@ -2,7 +2,11 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -32,19 +36,24 @@ CREATE TABLE IF NOT EXISTS admin_commands(id uuid PRIMARY KEY DEFAULT gen_random
 `
 
 func Migrate(ctx context.Context, db *pgxpool.Pool, owner string) error {
-	sql := map[string]string{"profile": profileSQL, "notification": notificationSQL, "admin": auditSQL}[owner]
-	if sql == "" {
+	base := map[string]string{"profile": profileSQL, "notification": notificationSQL, "admin": auditSQL}[owner]
+	if base == "" {
 		return errors.New("unknown migration owner")
 	}
+	steps := []string{commonSQL + base, ownerUpgradeSQL(owner)}
+	if owner == "admin" {
+		steps = append(steps, auditAdminActionSQL)
+	}
+	steps = append(steps, immutableReceiptSQL)
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "platform-migration-"+owner); err != nil {
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('platform-owner-migration'))"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, commonSQL); err != nil {
+	if _, err = tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS service_schema(owner text PRIMARY KEY,version integer NOT NULL)"); err != nil {
 		return err
 	}
 	var count int
@@ -54,11 +63,47 @@ func Migrate(ctx context.Context, db *pgxpool.Pool, owner string) error {
 	if count != 0 {
 		return errors.New("database already owned by another service")
 	}
-	if _, err = tx.Exec(ctx, sql); err != nil {
+	if _, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS service_migrations(owner text NOT NULL,version integer NOT NULL,checksum text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,version))`); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, "INSERT INTO service_schema(owner,version) VALUES($1,1) ON CONFLICT(owner) DO NOTHING", owner); err != nil {
+	var current int
+	if err = tx.QueryRow(ctx, "SELECT coalesce(max(version),0) FROM service_schema WHERE owner=$1", owner).Scan(&current); err != nil {
 		return err
+	}
+	if current > len(steps) {
+		return errors.New("database migration version newer than binary")
+	}
+	for i, sql := range steps {
+		version := i + 1
+		digest := sha256.Sum256([]byte(sql))
+		checksum := hex.EncodeToString(digest[:])
+		var recorded string
+		err = tx.QueryRow(ctx, "SELECT checksum FROM service_migrations WHERE owner=$1 AND version=$2", owner, version).Scan(&recorded)
+		if err == nil {
+			if recorded != checksum {
+				return fmt.Errorf("migration checksum mismatch owner=%s version=%d", owner, version)
+			}
+			continue
+		}
+		if version <= current && current != 1 {
+			return errors.New("applied migration checksum record missing")
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		// The legacy marker authenticates retained v1, whose original SQL bytes
+		// remain above. Adoption never re-executes that applied migration.
+		if !(version == 1 && current >= 1) {
+			if _, err = tx.Exec(ctx, sql); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO service_migrations(owner,version,checksum) VALUES($1,$2,$3)", owner, version, checksum); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO service_schema(owner,version) VALUES($1,$2) ON CONFLICT(owner) DO UPDATE SET version=EXCLUDED.version", owner, version); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

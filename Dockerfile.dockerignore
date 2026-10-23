@@ -12,3 +12,16 @@
 **/node_modules
 **/target
 **/bin
+**/.generic-local
+**/.generic-local/**
+**/*.key
+**/*.pem
+**/*.crt
+**/*.p12
+**/*.pfx
+**/dist
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.test
+**/coverage*

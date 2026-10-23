@@ -10,17 +10,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"net/http"
 	"platform-contracts/gen/go/events"
+	"platform-contracts/gen/go/eventsv2"
 	"platform-contracts/gen/go/internalhttp"
+	"platform-contracts/gen/go/internalhttpv2"
+	"strings"
 	"time"
 )
 
 type QuarantineAPI struct {
-	DB     *pgxpool.Pool
-	Config Config
-	Client *Client
-	Apply  func(context.Context, Envelope) error
-	Owner  string
-	Local  bool
+	DB      *pgxpool.Pool
+	Config  Config
+	Client  *Client
+	Apply   func(context.Context, Envelope) error
+	ApplyV2 func(context.Context, eventsv2.Envelope) error
+	Owner   string
+	Local   bool
 }
 
 func (q QuarantineAPI) authorize(w http.ResponseWriter, r *http.Request, permission string) (Actor, bool) {
@@ -31,7 +35,7 @@ func (q QuarantineAPI) authorize(w http.ResponseWriter, r *http.Request, permiss
 	return q.Client.Authenticate(w, r, permission, true)
 }
 func (q QuarantineAPI) List(w http.ResponseWriter, r *http.Request) {
-	if _, ok := q.authorize(w, r, "deliveries:read"); !ok {
+	if _, ok := q.authorize(w, r, "notifications:read"); !ok {
 		return
 	}
 	rows, err := q.DB.Query(r.Context(), "SELECT id,topic,partition_id,offset_id,reason,created_at,replayed_at FROM quarantine ORDER BY created_at DESC LIMIT 200")
@@ -51,6 +55,11 @@ func (q QuarantineAPI) List(w http.ResponseWriter, r *http.Request) {
 			Error(w, 503, "database_unavailable")
 			return
 		}
+		created = created.UTC()
+		if replayed != nil {
+			value := replayed.UTC()
+			replayed = &value
+		}
 		out = append(out, internalhttp.QuarantineRecord{ID: id, Topic: topic, Partition: int64(partition), Offset: offset, Reason: reason, CreatedAt: created, ReplayedAt: replayed, Owner: q.Owner})
 	}
 	if rows.Err() != nil {
@@ -60,7 +69,7 @@ func (q QuarantineAPI) List(w http.ResponseWriter, r *http.Request) {
 	JSON(w, 200, out)
 }
 func (q QuarantineAPI) Replay(w http.ResponseWriter, r *http.Request) {
-	actor, ok := q.authorize(w, r, "deliveries:replay")
+	actor, ok := q.authorize(w, r, "notifications:replay")
 	if !ok {
 		return
 	}
@@ -69,8 +78,12 @@ func (q QuarantineAPI) Replay(w http.ResponseWriter, r *http.Request) {
 		Error(w, 400, "invalid_quarantine")
 		return
 	}
-	var input internalhttp.ReplayRequest
+	var input internalhttpv2.QuarantineReplayRequest
 	if !Decode(w, r, &input) {
+		return
+	}
+	if strings.TrimSpace(input.Reason) == "" || len(input.Reason) > 500 {
+		Error(w, 400, "invalid_reason")
 		return
 	}
 	var topic, encrypted string
@@ -98,18 +111,40 @@ func (q QuarantineAPI) Replay(w http.ResponseWriter, r *http.Request) {
 	if len(input.CorrectedEvent) > 0 {
 		raw = input.CorrectedEvent
 	}
-	var e Envelope
-	if json.Unmarshal(raw, &e) != nil || Validate(e) != nil {
-		Error(w, 409, "record_still_invalid")
-		return
+	var header struct {
+		SchemaVersion int `json:"schema_version"`
 	}
-	if (original.EventID != "" && original.EventID != e.EventID) || (original.AggregateID != "" && original.AggregateID != e.AggregateID) {
+	_ = json.Unmarshal(raw, &header)
+	var eventID, aggregateID string
+	var apply func() error
+	if header.SchemaVersion == 2 {
+		var e eventsv2.Envelope
+		if json.Unmarshal(raw, &e) != nil || e.Validate() != nil || q.ApplyV2 == nil {
+			Error(w, 409, "record_still_invalid")
+			return
+		}
+		if e.Topic() != topic {
+			Error(w, 409, "record_topic_mismatch")
+			return
+		}
+		eventID, aggregateID = e.EventID, e.AggregateID
+		apply = func() error { return q.ApplyV2(r.Context(), e) }
+	} else {
+		var e Envelope
+		if json.Unmarshal(raw, &e) != nil || Validate(e) != nil {
+			Error(w, 409, "record_still_invalid")
+			return
+		}
+		expected, topicErr := events.Topic(e.EventType)
+		if topicErr != nil || expected != topic {
+			Error(w, 409, "record_topic_mismatch")
+			return
+		}
+		eventID, aggregateID = e.EventID, e.AggregateID
+		apply = func() error { return q.Apply(r.Context(), e) }
+	}
+	if (original.EventID != "" && original.EventID != eventID) || (original.AggregateID != "" && original.AggregateID != aggregateID) {
 		Error(w, 409, "record_identity_mismatch")
-		return
-	}
-	expected, err := events.Topic(e.EventType)
-	if err != nil || expected != topic {
-		Error(w, 409, "record_topic_mismatch")
 		return
 	}
 	lock, err := q.DB.Acquire(r.Context())
@@ -147,12 +182,12 @@ func (q QuarantineAPI) Replay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var replayID string
-	err = q.DB.QueryRow(r.Context(), "INSERT INTO quarantine_replays(quarantine_id,actor_id,encrypted_event) VALUES($1,$2,$3) RETURNING id", id, actor.UserID, correction).Scan(&replayID)
+	err = q.DB.QueryRow(r.Context(), "INSERT INTO quarantine_replays(quarantine_id,actor_id,encrypted_event,reason) VALUES($1,$2,$3,$4) RETURNING id", id, actor.UserID, correction, input.Reason).Scan(&replayID)
 	if err != nil {
 		Error(w, 503, "audit_unavailable")
 		return
 	}
-	if err = q.Apply(r.Context(), e); err != nil {
+	if err = apply(); err != nil {
 		Error(w, 409, "record_not_recoverable")
 		return
 	}

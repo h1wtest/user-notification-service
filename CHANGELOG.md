@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-24 — generic account and notification owners
+
+- Adopt retained inline v1 migrations into an append-only checksum ledger under a database-wide owner lock; additive owner migrations preserve encrypted jobs and purpose-separated keys.
+- Add independent EN/RU profile and notification locales, category preferences, masked Telegram state, live recipient-policy lookup and bounded HTTPS overview with explicit per-owner unavailable sections.
+- Require private Bot candidate plus same-session website confirmation for linking; fresh website reauthentication plus one-use Bot confirmation for unlinking, update deduplication and binding-version fencing. Narrow staff reset requires current permission, fresh MFA, reason and durable local audit.
+- Accept allowlisted external readiness/trading events only through scoped integration HMAC, timestamp/nonce checks and current identity/subscription authority; acceptance commits receipts plus owner outbox before HTTP202.
+- Consume strict v2 owner events alongside retained v1 drain, maintain immutable localized templates, durable reminders and fresh policy before provider attempts; preserve SMTP ambiguity and lease fencing.
+- Extend safe admin orchestration with recoverable command outcomes, current permissions, audited reasons, pagination and immutable template administration. No business SQL crosses owner databases.
+- Add admin-owner migration3 for typed identity administrative audit metadata: actor, operation, textual role/user/OAuth-client target and sanitized reason arrive through an independent one-event Kafka stream; no synchronous audit dependency or raw details payload is introduced.
+- Serialize notification preference changes on the same profile row as unlink/reset so replacement Telegram bindings cannot inherit stale concurrent opt-ins. Reject mismatched Kafka aggregate keys before owner callbacks and retain the original record encrypted in quarantine. Typed billing payment-review audit preserves actor/operation/reason with exact decision aggregate binding, never provider evidence bodies.
+- Reject reused v2 event IDs with changed immutable envelope content through transactional canonical receipt fingerprints, preserving explicit legacy drain semantics and quarantining unverifiable pre-fingerprint v2 replays. Resume undispatched moderation only after current authorization and authoritative owner absence using the same journal UUID. Delivery history now uses complete timestamp+UUID pagination via `X-Next-Cursor` without changing its array response.
+- Include a trusted-origin account recovery link in default EN/RU verification emails for fresh-browser verification; keep code/expiry separate and preserve immutable custom templates/history. Both retained v1 and v2 encrypted command paths supply the event-specific `verification_url`; PostgreSQL-to-real-SMTP and safe rendering regressions cover both paths.
+- New regressions are authored for parent integration verification; no new passing test/runtime/provider claim is made by this change entry.
+
 ## 2026-10-23 — platform remediation
 
 ### Changed

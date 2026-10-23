@@ -3,13 +3,13 @@ package audit
 import (
 	"context"
 	"encoding/json"
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"net/http"
 	"net/url"
-	"platform-contracts/gen/go/internalhttp"
 	"strings"
-	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"platform-contracts/gen/go/internalhttp"
+	"platform-contracts/gen/go/internalhttpv2"
 	"user-notification-service/internal/platform"
 )
 
@@ -24,11 +24,14 @@ type Service struct {
 func New(c platform.Config, db *pgxpool.Pool, client *platform.Client) (platform.App, error) {
 	s := &Service{DB: db, Config: c, Client: client, Audit: &PostgresAudit{DB: db}}
 	var err error
-	s.Consumer, err = platform.NewConsumer(db, c, "audit-v1", []string{"identity.events.v1"}, s.Apply)
+	s.Consumer, err = platform.NewConsumer(db, c, "audit-v1", []string{"identity.events.v1", "identity.events.v2", "profile.events.v2", "catalog.events.v1", "billing.events.v1", "subscription.events.v1", "referral.events.v1", "external.events.v1", "notification.events.v2"}, s.Apply)
+	if err == nil {
+		s.Consumer.ApplyV2 = s.ApplyV2
+	}
 	return s, err
 }
 func (s *Service) Ready(ctx context.Context) error {
-	if _, err := s.DB.Exec(ctx, "SELECT id FROM audit_events LIMIT 0; SELECT id FROM admin_commands LIMIT 0; SELECT event_id FROM inbox LIMIT 0; SELECT id FROM quarantine LIMIT 0"); err != nil {
+	if _, err := s.DB.Exec(ctx, "SELECT id,reason,idempotency_key,updated_at,result FROM admin_commands LIMIT 0; SELECT id,aggregate_id,aggregate_type,aggregate_version,producer FROM audit_events LIMIT 0; SELECT producer,aggregate_type,aggregate_id,version FROM audit_aggregate_versions LIMIT 0; SELECT event_id FROM audit_v2_receipts LIMIT 0; SELECT event_id FROM inbox LIMIT 0; SELECT id FROM quarantine LIMIT 0"); err != nil {
 		return err
 	}
 	if err := s.Client.DependencyReady(ctx, s.Config.IdentityURL); err != nil {
@@ -51,47 +54,19 @@ func (s *Service) Apply(ctx context.Context, e platform.Envelope) error {
 }
 func (s *Service) Routes(m *http.ServeMux) {
 	m.HandleFunc("GET /api/v1/admin/users", s.users)
+	m.HandleFunc("GET /api/v1/admin/users/{id}", s.user)
 	m.HandleFunc("POST /api/v1/admin/users/{id}/ban", s.ban)
 	m.HandleFunc("POST /api/v1/admin/users/{id}/unban", s.unban)
+	m.HandleFunc("POST /api/v1/admin/users/{id}/revoke-sessions", s.revokeSessions)
+	m.HandleFunc("GET /api/v1/admin/commands/{id}", s.commandStatus)
+	m.HandleFunc("POST /api/v1/admin/commands/{id}/resume", s.commandResume)
 	m.HandleFunc("GET /api/v1/admin/audit", s.audit)
 	m.HandleFunc("GET /api/v1/admin/deliveries", s.deliveries)
 	m.HandleFunc("POST /api/v1/admin/deliveries/{id}/replay", s.replay)
+	m.HandleFunc("GET /api/v1/admin/templates", s.templates)
+	m.HandleFunc("PUT /api/v1/admin/templates/{event_type}", s.publishTemplate)
 	m.HandleFunc("GET /api/v1/admin/quarantine", s.quarantine)
 	m.HandleFunc("POST /api/v1/admin/quarantine/{id}/replay", s.quarantineReplay)
-}
-func (s *Service) proxy(w http.ResponseWriter, r *http.Request, method, target string, body any) {
-	status, b, err := s.Client.Call(r.Context(), method, target, body, r)
-	if err != nil || status >= 500 {
-		platform.Error(w, 503, "dependency_unavailable")
-		return
-	}
-	if !json.Valid(b) {
-		platform.Error(w, 503, "invalid_dependency_response")
-		return
-	}
-	if status == http.StatusOK {
-		if strings.HasSuffix(target, "/deliveries") {
-			var result internalhttp.DeliveriesResponse
-			if json.Unmarshal(b, &result) != nil {
-				platform.Error(w, 503, "invalid_dependency_response")
-				return
-			}
-			platform.JSON(w, status, result)
-			return
-		}
-		if strings.HasSuffix(target, "/quarantine") {
-			var result internalhttp.QuarantineResponse
-			if json.Unmarshal(b, &result) != nil {
-				platform.Error(w, 503, "invalid_dependency_response")
-				return
-			}
-			platform.JSON(w, status, result)
-			return
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(b)
 }
 func (s *Service) users(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.Client.Authenticate(w, r, "users:read", true); !ok {
@@ -102,200 +77,271 @@ func (s *Service) users(w http.ResponseWriter, r *http.Request) {
 		platform.Error(w, 400, "query_too_long")
 		return
 	}
-	status, b, err := s.Client.Call(r.Context(), "GET", s.Config.IdentityURL+"/internal/v1/admin/users?query="+url.QueryEscape(query), nil, r)
-	if err != nil || status >= 500 {
-		platform.Error(w, 503, "identity_unavailable")
+	status, raw, err := s.Client.Call(r.Context(), "GET", s.Config.IdentityURL+"/internal/v2/admin/users?query="+url.QueryEscape(query), nil, r)
+	if !dependencyStatus(w, status, err, "identity_unavailable") {
 		return
 	}
-	if status != 200 {
-		platform.Error(w, status, "access_denied")
-		return
-	}
-	var result internalhttp.UsersResponse
-	if json.Unmarshal(b, &result) != nil {
+	var result internalhttpv2.UsersResponse
+	if json.Unmarshal(raw, &result) != nil {
 		platform.Error(w, 503, "invalid_identity_response")
 		return
 	}
 	if result.Users == nil {
-		result.Users = []internalhttp.UserSummary{}
+		result.Users = []internalhttpv2.UserSummary{}
 	}
 	platform.JSON(w, 200, result.Users)
 }
-func (s *Service) ban(w http.ResponseWriter, r *http.Request)   { s.command(w, r, "ban") }
-func (s *Service) unban(w http.ResponseWriter, r *http.Request) { s.command(w, r, "unban") }
-func (s *Service) command(w http.ResponseWriter, r *http.Request, action string) {
-	a, ok := s.Client.Authenticate(w, r, "users:write", true)
+func (s *Service) user(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "users:read", true); !ok {
+		return
+	}
+	id, ok := pathUUID(w, r, "invalid_user_id")
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
-	if _, err := uuid.Parse(id); err != nil {
-		platform.Error(w, 400, "invalid_user_id")
+	status, raw, err := s.Client.Call(r.Context(), "GET", s.Config.IdentityURL+"/internal/v2/admin/users/"+id, nil, r)
+	if !dependencyStatus(w, status, err, "identity_unavailable") {
 		return
 	}
-	var p internalhttp.BanRequest
-	if !platform.Decode(w, r, &p) {
+	var result internalhttpv2.UserSummary
+	if json.Unmarshal(raw, &result) != nil || result.ID != id {
+		platform.Error(w, 503, "invalid_identity_response")
 		return
 	}
-	if (p.Reason != nil && len(*p.Reason) > 500) || (action == "ban" && (p.Reason == nil || *p.Reason == "")) {
-		platform.Error(w, 400, "invalid_reason")
-		return
+	platform.JSON(w, 200, result)
+}
+func dependencyStatus(w http.ResponseWriter, status int, err error, unavailable string, raw ...[]byte) bool {
+	if err != nil || status >= 500 || status < 200 || status >= 300 && status < 400 {
+		platform.Error(w, 503, unavailable)
+		return false
 	}
-	commandID, err := s.Audit.Request(r.Context(), a.UserID, action, id)
-	if err != nil {
-		platform.Error(w, 503, "audit_unavailable")
-		return
-	}
-	status, b, err := s.Client.Call(r.Context(), "POST", s.Config.IdentityURL+"/internal/v1/admin/users/"+id+"/"+action, p, r)
-	outcome := "unknown"
-	if err == nil && status < 500 {
-		if status >= 200 && status < 300 {
-			outcome = "succeeded"
-		} else {
-			outcome = "denied"
+	if status != 200 {
+		code := "access_denied"
+		if status == 404 {
+			code = "not_found"
 		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	saveErr := s.Audit.Complete(ctx, commandID, outcome)
-	if err != nil || saveErr != nil || status >= 500 || !json.Valid(b) {
-		platform.Error(w, 503, "command_outcome_unknown")
-		return
-	}
-	if status >= 200 && status < 300 {
-		var result internalhttp.BanResponse
-		if json.Unmarshal(b, &result) != nil {
-			platform.Error(w, 503, "invalid_identity_response")
-			return
+		if status == 409 {
+			code = "version_conflict"
 		}
-		platform.JSON(w, status, result)
-		return
+		if status == 400 {
+			code = "invalid_request"
+		}
+		if len(raw) > 0 {
+			var owner internalhttpv2.ErrorResponse
+			if json.Unmarshal(raw[0], &owner) == nil {
+				switch owner.Code {
+				case "invalid_template", "unknown_template_variable", "unsafe_template_url", "version_conflict", "delivery_not_failed", "delivery_not_found", "not_replayable", "invalid_reason", "record_still_invalid", "record_identity_mismatch", "record_topic_mismatch", "quarantine_not_found", "record_not_recoverable":
+					code = owner.Code
+				}
+			}
+		}
+		platform.Error(w, status, code)
+		return false
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(b)
+	return true
 }
 func (s *Service) audit(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.Client.Authenticate(w, r, "audit:read", true); !ok {
 		return
 	}
-	rows, err := s.DB.Query(r.Context(), `SELECT id,event_type,actor_id,user_id,created_at FROM (SELECT id,event_type,actor_id,user_id,created_at FROM audit_events UNION ALL SELECT id,'admin.'||action||'.'||status,actor_id,target_id,created_at FROM admin_commands) all_events ORDER BY created_at DESC LIMIT 200`)
+	page, err := parsePage(r)
+	if err != nil {
+		platform.Error(w, 400, err.Error())
+		return
+	}
+	items, err := s.Audit.List(r.Context(), page)
 	if err != nil {
 		platform.Error(w, 503, "audit_unavailable")
 		return
 	}
-	defer rows.Close()
-	out := []map[string]any{}
-	for rows.Next() {
-		var id, event, user string
-		var actor *string
-		var created time.Time
-		if rows.Scan(&id, &event, &actor, &user, &created) != nil {
-			platform.Error(w, 503, "audit_unavailable")
-			return
-		}
-		out = append(out, map[string]any{"id": id, "event_type": event, "actor_id": actor, "user_id": user, "created_at": created})
+	var next *string
+	if len(items) > page.Limit {
+		items = items[:page.Limit]
+		last := items[len(items)-1]
+		cursor := encodeCursor(last.CreatedAt, last.ID)
+		next = &cursor
 	}
-	if rows.Err() != nil {
-		platform.Error(w, 503, "audit_unavailable")
-		return
+	if items == nil {
+		items = []AuditEvent{}
 	}
-	platform.JSON(w, 200, out)
+	platform.JSON(w, 200, struct {
+		Items      []AuditEvent `json:"items"`
+		NextCursor *string      `json:"next_cursor"`
+	}{items, next})
 }
 func (s *Service) deliveries(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.Client.Authenticate(w, r, "deliveries:read", true); !ok {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:read", true); !ok {
 		return
 	}
-	s.proxy(w, r, "GET", s.Config.NotificationURL+"/internal/v1/deliveries", nil)
+	status, raw, headers, err := s.Client.CallWithHeaders(r.Context(), "GET", s.Config.NotificationURL+"/internal/v1/deliveries"+forwardQuery(r), nil, r)
+	if !dependencyStatus(w, status, err, "notification_unavailable") {
+		return
+	}
+	var result internalhttp.DeliveriesResponse
+	if json.Unmarshal(raw, &result) != nil {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	if result == nil {
+		result = internalhttp.DeliveriesResponse{}
+	}
+	if cursor := headers.Get("X-Next-Cursor"); cursor != "" {
+		w.Header().Set("X-Next-Cursor", cursor)
+	}
+	platform.JSON(w, 200, result)
 }
-func (s *Service) replay(w http.ResponseWriter, r *http.Request) { s.replayProxy(w, r, "deliveries") }
-func (s *Service) quarantine(w http.ResponseWriter, r *http.Request) {
-	owner := r.URL.Query().Get("owner")
-	if owner == "audit" {
-		q := platform.QuarantineAPI{DB: s.DB, Config: s.Config, Client: s.Client, Apply: s.Apply, Owner: "audit", Local: true}
-		q.List(w, r)
-		return
+func forwardQuery(r *http.Request) string {
+	values := url.Values{}
+	for _, key := range []string{"cursor", "limit"} {
+		if value := r.URL.Query().Get(key); value != "" {
+			values.Set(key, value)
+		}
 	}
-	if _, ok := s.Client.Authenticate(w, r, "deliveries:read", true); !ok {
-		return
+	if len(values) == 0 {
+		return ""
 	}
-	base := s.Config.NotificationURL
-	if owner == "profile" {
-		base = s.Config.ProfileURL
-	} else if owner != "" && owner != "notification" {
-		platform.Error(w, 400, "invalid_owner")
-		return
-	}
-	s.proxy(w, r, "GET", base+"/internal/v1/quarantine", nil)
+	return "?" + values.Encode()
 }
-func (s *Service) quarantineReplay(w http.ResponseWriter, r *http.Request) {
-	owner := r.URL.Query().Get("owner")
-	if owner == "audit" {
-		q := platform.QuarantineAPI{DB: s.DB, Config: s.Config, Client: s.Client, Apply: s.Apply, Owner: "audit", Local: true}
-		q.Replay(w, r)
+func (s *Service) replay(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:replay", true); !ok {
 		return
 	}
-	s.replayProxy(w, r, "quarantine")
-}
-func (s *Service) replayProxy(w http.ResponseWriter, r *http.Request, kind string) {
-	a, ok := s.Client.Authenticate(w, r, "deliveries:replay", true)
+	id, ok := pathUUID(w, r, "invalid_id")
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
-	if _, err := uuid.Parse(id); err != nil {
-		platform.Error(w, 400, "invalid_id")
-		return
-	}
-	base := s.Config.NotificationURL
-	owner := r.URL.Query().Get("owner")
-	if kind == "quarantine" && owner == "profile" {
-		base = s.Config.ProfileURL
-	} else if owner != "" && owner != "notification" {
-		platform.Error(w, 400, "invalid_owner")
-		return
-	}
-	var input internalhttp.ReplayRequest
+	var input internalhttpv2.CommandRequest
 	if !platform.Decode(w, r, &input) {
 		return
 	}
-	var body any = internalhttp.ReplayRequest{}
-	if kind == "quarantine" {
-		body = input
-	} else if len(input.CorrectedEvent) > 0 {
-		platform.Error(w, 400, "invalid_request")
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.Reason == "" || len(input.Reason) > 500 {
+		platform.Error(w, 400, "invalid_reason")
 		return
 	}
-	commandID, requestErr := s.Audit.Request(r.Context(), a.UserID, kind+".replay", id)
-	if requestErr != nil {
-		platform.Error(w, 503, "audit_unavailable")
+	status, raw, err := s.Client.Call(r.Context(), "POST", s.Config.NotificationURL+"/internal/v1/deliveries/"+id+"/replay", input, r)
+	if !dependencyStatus(w, status, err, "notification_unavailable", raw) {
 		return
 	}
-	status, b, err := s.Client.Call(r.Context(), "POST", base+"/internal/v1/"+kind+"/"+id+"/replay", body, r)
-	outcome := "unknown"
-	if err == nil && status < 500 {
-		outcome = "denied"
-		if status < 300 {
-			outcome = "succeeded"
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	saved := s.Audit.Complete(ctx, commandID, outcome)
-	if err != nil || saved != nil || status >= 500 || !json.Valid(b) {
-		platform.Error(w, 503, "command_outcome_unknown")
+	var result internalhttpv2.ReplayResponse
+	if json.Unmarshal(raw, &result) != nil || result.Status != "queued" {
+		platform.Error(w, 503, "invalid_dependency_response")
 		return
 	}
-	if status >= 200 && status < 300 {
-		var result internalhttp.ReplayResponse
-		if json.Unmarshal(b, &result) != nil {
-			platform.Error(w, 503, "invalid_dependency_response")
-			return
-		}
-		platform.JSON(w, status, result)
+	platform.JSON(w, 200, result)
+}
+func (s *Service) templates(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:read", true); !ok {
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(b)
+	status, raw, err := s.Client.Call(r.Context(), "GET", s.Config.NotificationURL+"/internal/v2/templates", nil, r)
+	if !dependencyStatus(w, status, err, "notification_unavailable") {
+		return
+	}
+	var result internalhttpv2.TemplatesResponse
+	if json.Unmarshal(raw, &result) != nil {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	platform.JSON(w, 200, result)
+}
+func (s *Service) publishTemplate(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:templates:write", true); !ok {
+		return
+	}
+	eventType := r.PathValue("event_type")
+	if eventType == "" || len(eventType) > 100 {
+		platform.Error(w, 400, "invalid_event_type")
+		return
+	}
+	var input internalhttpv2.TemplatePublish
+	if !platform.Decode(w, r, &input) {
+		return
+	}
+	status, raw, err := s.Client.Call(r.Context(), "PUT", s.Config.NotificationURL+"/internal/v2/templates/"+url.PathEscape(eventType), input, r)
+	if !dependencyStatus(w, status, err, "notification_unavailable", raw) {
+		return
+	}
+	var result internalhttpv2.TemplateRevision
+	if json.Unmarshal(raw, &result) != nil || result.EventType != eventType {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	platform.JSON(w, 200, result)
+}
+func (s *Service) quarantine(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:read", true); !ok {
+		return
+	}
+	owner := r.URL.Query().Get("owner")
+	if owner == "audit" {
+		q := platform.QuarantineAPI{DB: s.DB, Config: s.Config, Client: s.Client, Apply: s.Apply, ApplyV2: s.ApplyV2, Owner: "audit", Local: true}
+		q.List(w, r)
+		return
+	}
+	base, ok := s.quarantineOwner(w, owner)
+	if !ok {
+		return
+	}
+	status, raw, err := s.Client.Call(r.Context(), "GET", base+"/internal/v1/quarantine", nil, r)
+	if !dependencyStatus(w, status, err, "dependency_unavailable") {
+		return
+	}
+	var result internalhttp.QuarantineResponse
+	if json.Unmarshal(raw, &result) != nil {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	if result == nil {
+		result = internalhttp.QuarantineResponse{}
+	}
+	platform.JSON(w, 200, result)
+}
+func (s *Service) quarantineOwner(w http.ResponseWriter, owner string) (string, bool) {
+	switch owner {
+	case "", "notification":
+		return s.Config.NotificationURL, true
+	case "profile":
+		return s.Config.ProfileURL, true
+	default:
+		platform.Error(w, 400, "invalid_owner")
+		return "", false
+	}
+}
+func (s *Service) quarantineReplay(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:replay", true); !ok {
+		return
+	}
+	if _, ok := pathUUID(w, r, "invalid_id"); !ok {
+		return
+	}
+	owner := r.URL.Query().Get("owner")
+	if owner == "audit" {
+		q := platform.QuarantineAPI{DB: s.DB, Config: s.Config, Client: s.Client, Apply: s.Apply, ApplyV2: s.ApplyV2, Owner: "audit", Local: true}
+		q.Replay(w, r)
+		return
+	}
+	base, ok := s.quarantineOwner(w, owner)
+	if !ok {
+		return
+	}
+	var input internalhttpv2.QuarantineReplayRequest
+	if !platform.Decode(w, r, &input) {
+		return
+	}
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.Reason == "" || len(input.Reason) > 500 {
+		platform.Error(w, 400, "invalid_reason")
+		return
+	}
+	status, raw, err := s.Client.Call(r.Context(), "POST", base+"/internal/v1/quarantine/"+r.PathValue("id")+"/replay", input, r)
+	if !dependencyStatus(w, status, err, "dependency_unavailable", raw) {
+		return
+	}
+	var result internalhttpv2.ReplayResponse
+	if json.Unmarshal(raw, &result) != nil || result.Status != "replayed" {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	platform.JSON(w, 200, result)
 }

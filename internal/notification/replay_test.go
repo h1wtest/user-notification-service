@@ -18,7 +18,7 @@ func TestPoisonCorrectionReplaysOnceWithDurableActorAudit(t *testing.T) {
 	key := make([]byte, 32)
 	actorID := uuid.NewString()
 	identity := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		platform.JSON(w, 200, platform.Actor{Active: true, UserID: actorID, Email: "admin@example.test", SessionID: "019a0000-0000-7000-8000-000000000004", Roles: []string{"admin"}, MFAVerified: true, Permissions: []string{"deliveries:replay"}})
+		platform.JSON(w, 200, platform.Actor{Active: true, UserID: actorID, Email: "admin@example.test", SessionID: "019a0000-0000-7000-8000-000000000004", Roles: []string{"admin"}, MFAVerified: true, Permissions: []string{"notifications:replay"}})
 	}))
 	defer identity.Close()
 	c := platform.Config{DeliveryKey: key, QuarantineKey: make([]byte, 32), IdentityURL: identity.URL, AdminToken: "admin-client"}
@@ -36,7 +36,7 @@ func TestPoisonCorrectionReplaysOnceWithDurableActorAudit(t *testing.T) {
 	eventID, user := uuid.NewString(), uuid.NewString()
 	payload, _ := json.Marshal(map[string]string{"user_id": user})
 	event := platform.Envelope{SchemaVersion: 1, EventID: eventID, EventType: "identity.email_verified", AggregateID: user, OccurredAt: time.Now(), Payload: payload}
-	body, err := json.Marshal(map[string]any{"corrected_event": event})
+	body, err := json.Marshal(map[string]any{"corrected_event": event, "reason": "correct poisoned event"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestPoisonCorrectionReplaysOnceWithDurableActorAudit(t *testing.T) {
 		m.ServeHTTP(w, r)
 		return w
 	}
-	if w := request(`{}`); w.Code != 409 {
+	if w := request(`{"reason":"retry original"}`); w.Code != 409 {
 		t.Fatalf("invalid original reported successful replay: %d", w.Code)
 	}
 	if w := request(string(body)); w.Code != 200 {

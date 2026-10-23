@@ -100,3 +100,13 @@ func TestCiphertextRejectsDifferentEventIdentity(t *testing.T) {
 		t.Fatal("ciphertext accepted different event identity")
 	}
 }
+
+func cleanupDelivery(t *testing.T, db *pgxpool.Pool, id string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = db.Exec(ctx, "DELETE FROM delivery_attempts WHERE job_id=$1", id)
+		_, _ = db.Exec(ctx, "DELETE FROM replay_audit WHERE delivery_id=$1", id)
+		_, _ = db.Exec(ctx, "DELETE FROM delivery_jobs WHERE id=$1 OR event_id=$1", id)
+	})
+}

@@ -26,11 +26,14 @@ import (
 type Job struct {
 	ID, EventID, Channel, EncryptedBody, MessageID, LeaseToken, Traceparent string
 	Attempts                                                                int
+	UserID, EventType                                                       string
+	RetryAfter                                                              time.Duration
+	Deferred                                                                bool
 }
 
 func (s *PostgresJobs) Claim(ctx context.Context) (Job, error) {
 	var j Job
-	err := s.DB.QueryRow(ctx, `WITH exhausted AS (UPDATE delivery_jobs SET status='failed',ambiguous=ambiguous OR status='leased',lease_until=NULL,lease_token=NULL,last_error='attempts_exhausted' WHERE attempts>=8 AND status IN ('pending','retry','leased') AND (status<>'leased' OR lease_until<now()) RETURNING id,attempts), exhausted_audit AS (INSERT INTO delivery_attempts(job_id,attempt,status) SELECT id,attempts,'failed' FROM exhausted), candidate AS (SELECT id FROM delivery_jobs WHERE attempts<8 AND ((status IN ('pending','retry') AND next_attempt_at<=now()) OR (status='leased' AND lease_until<now())) ORDER BY next_attempt_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE delivery_jobs j SET status='leased',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '60 seconds',ambiguous=j.ambiguous OR j.status='leased' FROM candidate c WHERE j.id=c.id RETURNING j.id,j.event_id,j.channel,j.encrypted_body,j.message_id,j.lease_token,j.attempts,coalesce(j.traceparent,'')`, uuid.NewString()).Scan(&j.ID, &j.EventID, &j.Channel, &j.EncryptedBody, &j.MessageID, &j.LeaseToken, &j.Attempts, &j.Traceparent)
+	err := s.DB.QueryRow(ctx, `WITH exhausted AS (UPDATE delivery_jobs SET status='failed',ambiguous=ambiguous OR status='leased',lease_until=NULL,lease_token=NULL,last_error='attempts_exhausted' WHERE attempts>=8 AND status IN ('pending','retry','leased') AND (status<>'leased' OR lease_until<now()) RETURNING id,attempts), exhausted_audit AS (INSERT INTO delivery_attempts(job_id,attempt,status) SELECT id,attempts,'failed' FROM exhausted), candidate AS (SELECT id FROM delivery_jobs WHERE attempts<8 AND ((status IN ('pending','retry') AND next_attempt_at<=now()) OR (status='leased' AND lease_until<now())) ORDER BY next_attempt_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE delivery_jobs j SET status='leased',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '60 seconds',ambiguous=j.ambiguous OR j.status='leased' FROM candidate c WHERE j.id=c.id RETURNING j.id,j.event_id,j.channel,j.encrypted_body,j.message_id,j.lease_token,j.attempts,coalesce(j.traceparent,''),j.user_id::text,coalesce((SELECT event_type FROM inbox WHERE event_id=j.event_id),'')`, uuid.NewString()).Scan(&j.ID, &j.EventID, &j.Channel, &j.EncryptedBody, &j.MessageID, &j.LeaseToken, &j.Attempts, &j.Traceparent, &j.UserID, &j.EventType)
 	return j, err
 }
 func backoff(attempt int) time.Duration {
@@ -46,12 +49,15 @@ func (s *PostgresJobs) Finish(ctx context.Context, j Job, success, permanent boo
 	status := "retry"
 	var delivered *time.Time
 	next := time.Now().Add(backoff(j.Attempts))
+	if j.RetryAfter > 0 {
+		next = time.Now().Add(j.RetryAfter)
+	}
 	if success {
 		status = "sent"
 		now := time.Now()
 		delivered = &now
 		reason = ""
-	} else if permanent || j.Attempts >= 8 {
+	} else if permanent || (j.Attempts >= 8 && !j.Deferred) {
 		status = "failed"
 	}
 	tx, err := s.DB.Begin(ctx)
@@ -59,7 +65,7 @@ func (s *PostgresJobs) Finish(ctx context.Context, j Job, success, permanent boo
 		return err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE delivery_jobs SET status=$3,next_attempt_at=$4,lease_until=NULL,lease_token=NULL,last_error=nullif($5,''),delivered_at=$6,ambiguous=ambiguous OR ($3<>'sent' AND $5='provider_outcome_unknown'),encrypted_body=CASE WHEN $3='sent' THEN '' ELSE encrypted_body END WHERE id=$1 AND lease_token=$2 AND status='leased'`, j.ID, j.LeaseToken, status, next, reason, delivered)
+	tag, err := tx.Exec(ctx, `UPDATE delivery_jobs SET status=$3,next_attempt_at=$4,lease_until=NULL,lease_token=NULL,last_error=nullif($5,''),delivered_at=$6,attempts=attempts-CASE WHEN $7 THEN 1 ELSE 0 END,ambiguous=ambiguous OR ($3<>'sent' AND $5='provider_outcome_unknown'),encrypted_body=CASE WHEN $3='sent' THEN '' ELSE encrypted_body END WHERE id=$1 AND lease_token=$2 AND status='leased'`, j.ID, j.LeaseToken, status, next, reason, delivered, j.Deferred)
 	if err != nil {
 		return err
 	}
@@ -73,6 +79,7 @@ func (s *PostgresJobs) Finish(ctx context.Context, j Job, success, permanent boo
 }
 func (s *Service) Work(ctx context.Context) error {
 	for ctx.Err() == nil {
+		_ = s.pumpReminders(ctx)
 		j, err := s.Jobs.Claim(ctx)
 		if errors.Is(err, pgx.ErrNoRows) {
 			if !platform.Pause(ctx, 300*time.Millisecond) {
@@ -102,11 +109,21 @@ func (s *Service) Work(ctx context.Context) error {
 			reason = "intent_expired"
 		} else {
 			deadline, cancel := context.WithTimeout(spanCtx, 15*time.Second)
-			provider := s.Providers[j.Channel]
-			if provider == nil {
-				permanent, reason, err = true, "invalid_channel", errors.New("unknown delivery channel")
-			} else {
-				permanent, reason, err = provider.Send(deadline, j, body)
+			permanent, reason, err = s.checkAttempt(deadline, j, body)
+			if err != nil && !permanent {
+				j.Deferred = true
+			}
+			if err == nil {
+				provider := s.Providers[j.Channel]
+				if provider == nil {
+					permanent, reason, err = true, "invalid_channel", errors.New("unknown delivery channel")
+				} else {
+					permanent, reason, err = provider.Send(deadline, j, body)
+				}
+			}
+			var retry *providerRetry
+			if errors.As(err, &retry) {
+				j.RetryAfter = retry.After
 			}
 			cancel()
 		}
@@ -216,8 +233,11 @@ func (s *Service) sendTelegram(ctx context.Context, j Job, b Body) (bool, string
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 65536))
 	var result struct {
-		OK        bool `json:"ok"`
-		ErrorCode int  `json:"error_code"`
+		OK         bool `json:"ok"`
+		ErrorCode  int  `json:"error_code"`
+		Parameters struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err != nil || json.Unmarshal(data, &result) != nil {
 		return false, "provider_outcome_unknown", errors.New("invalid telegram response")
@@ -225,6 +245,17 @@ func (s *Service) sendTelegram(ctx context.Context, j Job, b Body) (bool, string
 	if result.OK && response.StatusCode == 200 {
 		return false, "", nil
 	}
+	if response.StatusCode == 429 || result.ErrorCode == 429 {
+		delay := time.Duration(result.Parameters.RetryAfter) * time.Second
+		if delay <= 0 {
+			delay = backoff(j.Attempts)
+		}
+		return false, "telegram_rate_limited", &providerRetry{After: delay}
+	}
 	permanent := response.StatusCode == 400 || response.StatusCode == 401 || response.StatusCode == 403
 	return permanent, "telegram_rejected", fmt.Errorf("telegram status %d", response.StatusCode)
 }
+
+type providerRetry struct{ After time.Duration }
+
+func (e *providerRetry) Error() string { return "provider retry scheduled" }

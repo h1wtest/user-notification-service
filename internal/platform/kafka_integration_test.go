@@ -23,13 +23,19 @@ func TestRealKafkaFailedRecordIsReseekedBeforeLaterOffsetCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	group := "regression-" + uuid.NewString()
-	// Plaintext is scoped to this test-only disposable broker, never runtime
-	// NewConsumer, which requires TLS/SCRAM without a plaintext fallback.
-	client, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...), kgo.ConsumerGroup(group), kgo.ConsumeTopics("identity.events.v1"), kgo.DisableAutoCommit(), kgo.BlockRebalanceOnPoll(), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	config := Config{KafkaCA: os.Getenv("TEST_KAFKA_CA"), KafkaUsername: os.Getenv("TEST_KAFKA_USERNAME"), KafkaPassword: os.Getenv("TEST_KAFKA_PASSWORD"), QuarantineKey: make([]byte, 32)}
+	security, err := KafkaSecurity(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	producer, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...))
+	// Use the same verified TLS/SCRAM adapter as production for both peers.
+	options := append([]kgo.Opt{kgo.SeedBrokers(strings.Split(brokers, ",")...)}, security...)
+	consumerOptions := append(append([]kgo.Opt{}, options...), kgo.ConsumerGroup(group), kgo.ConsumeTopics("identity.events.v1"), kgo.DisableAutoCommit(), kgo.BlockRebalanceOnPoll(), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	client, err := kgo.NewClient(consumerOptions...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := kgo.NewClient(options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +59,7 @@ func TestRealKafkaFailedRecordIsReseekedBeforeLaterOffsetCommit(t *testing.T) {
 	if err = Migrate(ctx, db, "notification"); err != nil {
 		t.Fatal(err)
 	}
-	consumer := &Consumer{DB: db, Config: Config{QuarantineKey: make([]byte, 32)}, Kafka: client, Apply: func(ctx context.Context, e Envelope) error {
+	consumer := &Consumer{DB: db, Config: config, Kafka: client, Apply: func(ctx context.Context, e Envelope) error {
 		if e.EventID == id1 {
 			if attempts.Add(1) == 1 {
 				return errors.New("transient application failure")

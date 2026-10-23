@@ -38,7 +38,7 @@ func TestNotificationMigrationCLIRequiresOnlyDatabaseURL(t *testing.T) {
 	}
 	defer db.Close()
 	var owner string
-	if err = db.QueryRow(ctx, "SELECT owner FROM service_schema WHERE owner='notification' AND version=1").Scan(&owner); err != nil {
+	if err = db.QueryRow(ctx, "SELECT owner FROM service_schema WHERE owner='notification' AND version=$1", ownerSchemaVersion("notification")).Scan(&owner); err != nil {
 		t.Fatal(err)
 	}
 }

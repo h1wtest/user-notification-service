@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"platform-contracts/gen/go/events"
 	"platform-contracts/gen/go/internalhttp"
+	"platform-contracts/gen/go/internalhttpv2"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,6 +39,7 @@ type Config struct {
 	SMTPHost, SMTPPort, SMTPFrom, SMTPUser, SMTPPassword                                                                   string
 	SMTPInsecure                                                                                                           bool
 	TelegramToken, TelegramBase, TelegramWebhookSecret                                                                     string
+	BillingURL, SubscriptionURL, ReferralURL, ExternalIntegrations                                                         string
 }
 
 func Env(key, fallback string) string {
@@ -49,6 +51,10 @@ func Env(key, fallback string) string {
 func Load(kind string) (Config, error) {
 	ports := map[string]string{"profile": "8002", "notification": "8003", "admin": "8004", "worker": "8005"}
 	c := Config{Kind: kind, DSN: os.Getenv("DATABASE_URL"), Port: Env("HTTP_PORT", ports[kind]), Origin: os.Getenv("PUBLIC_ORIGIN"), Token: os.Getenv("INTERNAL_SERVICE_TOKEN"), NotificationToken: os.Getenv("NOTIFICATION_INTERNAL_TOKEN"), AdminToken: os.Getenv("ADMIN_INTERNAL_TOKEN"), IdentityURL: Env("IDENTITY_URL", "https://identity-service:8001"), ProfileURL: Env("PROFILE_URL", "https://profile-service:8002"), NotificationURL: Env("NOTIFICATION_URL", "https://notification-service:8003"), Cert: os.Getenv("TLS_CERT_FILE"), Key: os.Getenv("TLS_KEY_FILE"), CA: os.Getenv("INTERNAL_CA_FILE"), Brokers: strings.Split(Env("KAFKA_BROKERS", "redpanda:29092"), ","), SMTPHost: Env("SMTP_HOST", "mailpit"), SMTPPort: Env("SMTP_PORT", "1025"), SMTPFrom: Env("SMTP_FROM", "no-reply@sso.local"), SMTPUser: os.Getenv("SMTP_USER"), SMTPPassword: os.Getenv("SMTP_PASSWORD"), SMTPInsecure: os.Getenv("SMTP_ALLOW_INSECURE") == "true", TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"), TelegramBase: Env("TELEGRAM_API_BASE", "https://api.telegram.org"), TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET")}
+	c.BillingURL = Env("BILLING_URL", "https://billing-service:8007")
+	c.SubscriptionURL = Env("SUBSCRIPTION_URL", "https://subscription-service:8008")
+	c.ReferralURL = Env("REFERRAL_URL", "https://referral-service:8009")
+	c.ExternalIntegrations = os.Getenv("EXTERNAL_EVENT_INTEGRATIONS")
 	if c.DSN == "" {
 		return c, errors.New("DATABASE_URL required")
 	}
@@ -136,7 +142,7 @@ func ServiceAuthorized(r *http.Request, token string) bool {
 	return token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Service-Token")), []byte(token)) == 1
 }
 
-type Actor = internalhttp.IntrospectResponse
+type Actor = internalhttpv2.IntrospectResponse
 type Client struct {
 	HTTP   *http.Client
 	Config Config
@@ -175,21 +181,25 @@ func ForwardActor(dst, src *http.Request) {
 	}
 }
 func (c *Client) Call(ctx context.Context, method, target string, body any, source *http.Request) (int, []byte, error) {
+	status, data, _, err := c.CallWithHeaders(ctx, method, target, body, source)
+	return status, data, err
+}
+func (c *Client) CallWithHeaders(ctx context.Context, method, target string, body any, source *http.Request) (int, []byte, http.Header, error) {
 	u, err := url.Parse(target)
 	if err != nil || u.Scheme != "https" {
-		return 503, nil, errors.New("internal HTTPS required")
+		return 503, nil, nil, errors.New("internal HTTPS required")
 	}
 	var reader io.Reader
 	if body != nil {
 		b, e := json.Marshal(body)
 		if e != nil {
-			return 503, nil, e
+			return 503, nil, nil, e
 		}
 		reader = strings.NewReader(string(b))
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, reader)
 	if err != nil {
-		return 503, nil, err
+		return 503, nil, nil, err
 	}
 	req.Header.Set("X-Service-Token", c.Config.Token)
 	if body != nil {
@@ -200,11 +210,11 @@ func (c *Client) Call(ctx context.Context, method, target string, body any, sour
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return 503, nil, errors.New("dependency unavailable")
+		return 503, nil, nil, errors.New("dependency unavailable")
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode, b, err
+	return resp.StatusCode, b, resp.Header.Clone(), err
 }
 func (c *Client) Authenticate(w http.ResponseWriter, r *http.Request, permission string, mfa bool) (Actor, bool) {
 	var actor Actor
@@ -226,8 +236,8 @@ func (c *Client) Authenticate(w http.ResponseWriter, r *http.Request, permission
 		return actor, false
 	}
 	csrf, origin, method := r.Header.Get("X-CSRF-Token"), r.Header.Get("Origin"), r.Method
-	body := internalhttp.IntrospectRequest{SessionCookie: &cookie, AccessToken: &token, CSRFToken: &csrf, Method: &method, Origin: &origin, Permission: &permission, RequireMFA: &mfa}
-	status, b, err := c.Call(r.Context(), "POST", c.Config.IdentityURL+"/internal/v1/introspect", body, r)
+	body := internalhttpv2.IntrospectRequest{SessionCookie: &cookie, AccessToken: &token, CSRFToken: &csrf, Method: &method, Origin: &origin, Permission: &permission, RequireMFA: &mfa}
+	status, b, err := c.Call(r.Context(), "POST", c.Config.IdentityURL+"/internal/v2/introspect", body, r)
 	if err != nil || status >= 500 {
 		Error(w, 503, "identity_unavailable")
 		return actor, false
@@ -343,7 +353,7 @@ func Serve(kind string, build func(Config, *pgxpool.Pool, *Client) (App, error))
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) { JSON(w, 200, map[string]bool{"live": true}) })
 	ready := func(ctx context.Context) error {
 		var marker string
-		if err := db.QueryRow(ctx, "SELECT owner FROM service_schema WHERE owner=$1 AND version=1", owner).Scan(&marker); err != nil {
+		if err := db.QueryRow(ctx, "SELECT owner FROM service_schema WHERE owner=$1 AND version=$2", owner, ownerSchemaVersion(owner)).Scan(&marker); err != nil {
 			return err
 		}
 		return app.Ready(ctx)
