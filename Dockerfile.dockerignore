@@ -1,0 +1,14 @@
+**
+!user-notification-service/
+!user-notification-service/**
+!platform-contracts/
+!platform-contracts/**
+**/.git
+**/.git/**
+**/.env
+**/.env.*
+**/.local
+**/.local/**
+**/node_modules
+**/target
+**/bin
