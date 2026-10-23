@@ -14,8 +14,8 @@
 - Require the canonical contracts repository and verified checkout SHA, scan full service history plus pinned contracts before dependencies with redacted output, and avoid persisted Git credentials; retain real PostgreSQL/Kafka race gates and exact contract-tree checks.
 - Profile PATCH now distinguishes omission, JSON null and empty strings for each nullable profile field: null persists SQL NULL without changing omitted fields; strict decoding and existing non-null validation remain in force. Added real PostgreSQL/public-handler regressions for independent clearing and invalid field types.
 - Updated Go identity fixtures to complete canonical introspection responses with valid user/session UUIDs and non-null role/permission arrays; added fail-closed client regressions for malformed successful identity responses without relaxing generated validation.
-- Scan each actual final command image archive with matching image-ID and nonzero-package checks, rejecting vulnerabilities at every severity and retaining raw reports only in disposable runner storage.
-- Upgraded golang.org/x/sys from v0.35.0 to v0.44.0 for CVE-2026-39824, discovered by the all-severity scan of the actual profile command image; artifact rescans remain required for all four commands.
+- Removed vulnerability scanner commands and final-image scan/archive/report-cleanup steps by policy; retained secret scans, contracts provenance, all four immutable command image builds and their labels, and real build/test gates. Historical scan observations below are superseded as active requirements and must not be rerun; this removal makes no claim that vulnerabilities are absent.
+- Upgraded golang.org/x/sys from v0.35.0 to v0.44.0 for CVE-2026-39824, discovered by a historical scan of the actual profile command image; the patched dependency remains pinned.
 
 ### Observed verification
 
