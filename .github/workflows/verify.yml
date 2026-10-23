@@ -1,0 +1,105 @@
+name: verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      contracts_revision:
+        description: Immutable platform-contracts commit (40 hex)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CONTRACTS_REVISION: ${{ inputs.contracts_revision || vars.PLATFORM_CONTRACTS_REVISION }}
+    services:
+      postgres:
+        image: postgres:18.6-bookworm@sha256:bbf83594798e144bff365a9c191c5d779f181fb3135902064ab8ff11918020fc
+        env:
+          POSTGRES_USER: regression
+          POSTGRES_PASSWORD: local-regression-only
+          POSTGRES_DB: notification_regression
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U regression -d notification_regression" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: user-notification-service
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require immutable contract revision
+        run: |
+          [[ "$CONTRACTS_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "PLATFORM_CONTRACTS_REVISION must be an explicit immutable commit" >&2; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: h1wtest/platform-contracts
+          ref: ${{ env.CONTRACTS_REVISION }}
+          path: platform-contracts
+          persist-credentials: false
+      - name: Scan service history and pinned contracts for secrets
+        run: |
+          docker run --rm -v "$PWD/user-notification-service:/repo:ro" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git /repo --no-banner --redact
+          docker run --rm -v "$PWD/platform-contracts:/repo:ro" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f dir /repo --no-banner --redact
+      - name: Record immutable source provenance
+        run: |
+          test "$(git -C platform-contracts rev-parse HEAD)" = "$CONTRACTS_REVISION"
+          printf 'service_revision=%s\ncontracts_revision=%s\n' "$GITHUB_SHA" "$CONTRACTS_REVISION" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify pinned contract source tree
+        run: python3 user-notification-service/scripts/contracts-digest.py platform-contracts --verify user-notification-service/contracts-tree.sha256
+      - name: Verify contracts source mismatch regression
+        run: python3 -m unittest discover -s user-notification-service/scripts -p 'test_contracts_digest.py'
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: user-notification-service/go.sum
+      - name: Verify
+        working-directory: user-notification-service
+        env:
+          TEST_DATABASE_URL: postgres://regression:local-regression-only@127.0.0.1:5432/notification_regression?sslmode=disable
+        run: |
+          go mod download
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          bash scripts/ci-broker.sh
+          go build ./cmd/...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - name: Build immutable command images without publishing
+        run: |
+          for target in profile notification worker admin; do
+            tree=$(cat user-notification-service/contracts-tree.sha256)
+            docker build --build-arg TARGET="$target" --label "org.opencontainers.image.revision=${{ github.sha }}" --label "platform.contracts.revision=$CONTRACTS_REVISION" --label "platform.contracts.tree=$tree" -f user-notification-service/Dockerfile -t "platform-$target:${{ github.sha }}-$tree" .
+          done
+      - name: Scan actual final command images at all severities
+        env:
+          TRIVY: docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+        run: |
+          umask 077
+          tree=$(cat user-notification-service/contracts-tree.sha256)
+          for target in profile notification worker admin; do
+            image_id=$(docker image inspect "platform-$target:$GITHUB_SHA-$tree" --format '{{.Id}}')
+            docker image save "$image_id" --output "$RUNNER_TEMP/$target-image.tar"
+            docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input "/reports/$target-image.tar" --scanners vuln --format json --output "/reports/$target-vulnerabilities.json" --exit-code 1
+            IMAGE_ID="$image_id" TARGET="$target" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads((Path(os.environ['RUNNER_TEMP']) / (os.environ['TARGET'] + '-vulnerabilities.json')).read_text())
+          if report.get('Metadata', {}).get('ImageID') != os.environ['IMAGE_ID']:
+              raise SystemExit('Scanned image differs from the built immutable image ID')
+          packages = sum(len(entry.get('Packages', [])) for entry in report.get('Results', []) if entry.get('Class') in ('os-pkgs', 'lang-pkgs'))
+          if not packages:
+              raise SystemExit('Final image scan evaluated zero packages; not a clean result')
+          print(f"{os.environ['TARGET']}: evaluated packages={packages}; zero vulnerabilities across all severities")
+          PY
+            rm -f "$RUNNER_TEMP/$target-image.tar" "$RUNNER_TEMP/$target-vulnerabilities.json"
+          done
+      - name: Remove final image scan material
+        if: always()
+        run: |
+          for target in profile notification worker admin; do
+            rm -f "$RUNNER_TEMP/$target-image.tar" "$RUNNER_TEMP/$target-vulnerabilities.json"
+          done

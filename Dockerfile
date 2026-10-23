@@ -1,36 +1,15 @@
-# ==========================================
-# Build Stage
-# ==========================================
-FROM golang:alpine AS builder
-
+FROM golang:1.26.10-alpine3.23@sha256:0525c952defebc693cdaf62cdf43afa32be5a7f377e99260642ea19c240c708e AS builder
+ARG TARGET=profile
 WORKDIR /build
-
-# Copy platform-contracts module
 COPY platform-contracts ./platform-contracts
-
-# Copy user-notification-service source
 COPY user-notification-service ./user-notification-service
-
 WORKDIR /build/user-notification-service
+RUN case "$TARGET" in profile|notification|worker|admin) ;; *) exit 2 ;; esac && CGO_ENABLED=0 GOOS=linux go build -mod=readonly -trimpath -ldflags="-w -s" -o /build/service ./cmd/${TARGET}
 
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /build/user-notification-service/bin/app ./cmd/app
-
-# ==========================================
-# Runtime Stage (Minimal & Secure Non-Root)
-# ==========================================
-FROM alpine:3.21 AS runner
-
-RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -g 10001 -S appgroup && \
-    adduser -u 10001 -S appuser -G appgroup
-
+FROM scratch AS runner
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 WORKDIR /app
-
-COPY --from=builder /build/user-notification-service/bin/app /app/app
-COPY --from=builder /build/user-notification-service/migrations /app/migrations
-
+COPY --from=builder /build/service /app/service
 USER 10001:10001
-
-EXPOSE 8002
-
-ENTRYPOINT ["/app/app"]
+EXPOSE 8002 8003 8004 8005
+ENTRYPOINT ["/app/service"]
