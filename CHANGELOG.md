@@ -15,6 +15,7 @@
 - Profile PATCH now distinguishes omission, JSON null and empty strings for each nullable profile field: null persists SQL NULL without changing omitted fields; strict decoding and existing non-null validation remain in force. Added real PostgreSQL/public-handler regressions for independent clearing and invalid field types.
 - Updated Go identity fixtures to complete canonical introspection responses with valid user/session UUIDs and non-null role/permission arrays; added fail-closed client regressions for malformed successful identity responses without relaxing generated validation.
 - Scan each actual final command image archive with matching image-ID and nonzero-package checks, rejecting vulnerabilities at every severity and retaining raw reports only in disposable runner storage.
+- Upgraded golang.org/x/sys from v0.35.0 to v0.44.0 for CVE-2026-39824, discovered by the all-severity scan of the actual profile command image; artifact rescans remain required for all four commands.
 
 ### Observed verification
 

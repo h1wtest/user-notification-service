@@ -26,7 +26,7 @@ jobs:
         ports: ['5432:5432']
         options: --health-cmd "pg_isready -U regression -d notification_regression" --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: user-notification-service
           fetch-depth: 0
@@ -34,7 +34,7 @@ jobs:
       - name: Require immutable contract revision
         run: |
           [[ "$CONTRACTS_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "PLATFORM_CONTRACTS_REVISION must be an explicit immutable commit" >&2; exit 1; }
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: h1wtest/platform-contracts
           ref: ${{ env.CONTRACTS_REVISION }}
@@ -52,7 +52,7 @@ jobs:
         run: python3 user-notification-service/scripts/contracts-digest.py platform-contracts --verify user-notification-service/contracts-tree.sha256
       - name: Verify contracts source mismatch regression
         run: python3 -m unittest discover -s user-notification-service/scripts -p 'test_contracts_digest.py'
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version: '1.26.10'
           cache-dependency-path: user-notification-service/go.sum
@@ -79,24 +79,32 @@ jobs:
         run: |
           umask 077
           tree=$(cat user-notification-service/contracts-tree.sha256)
+          gate_status=0
           for target in profile notification worker admin; do
             image_id=$(docker image inspect "platform-$target:$GITHUB_SHA-$tree" --format '{{.Id}}')
             docker image save "$image_id" --output "$RUNNER_TEMP/$target-image.tar"
-            docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input "/reports/$target-image.tar" --scanners vuln --format json --output "/reports/$target-vulnerabilities.json" --exit-code 1
-            IMAGE_ID="$image_id" TARGET="$target" python3 - <<'PY'
+            scan_status=0
+            docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input "/reports/$target-image.tar" --scanners vuln --format json --output "/reports/$target-vulnerabilities.json" --exit-code 1 || scan_status=$?
+            IMAGE_ID="$image_id" TARGET="$target" SCAN_STATUS="$scan_status" python3 - <<'PY' || gate_status=1
           import json
           import os
           from pathlib import Path
           report = json.loads((Path(os.environ['RUNNER_TEMP']) / (os.environ['TARGET'] + '-vulnerabilities.json')).read_text())
+          findings = [finding for entry in report.get('Results', []) for finding in entry.get('Vulnerabilities', [])]
+          for finding in findings:
+              print(os.environ['TARGET'] + ': ' + json.dumps({key: finding.get(key, '') for key in ('VulnerabilityID', 'PkgName', 'InstalledVersion', 'FixedVersion', 'Severity')}, ensure_ascii=True))
           if report.get('Metadata', {}).get('ImageID') != os.environ['IMAGE_ID']:
               raise SystemExit('Scanned image differs from the built immutable image ID')
           packages = sum(len(entry.get('Packages', [])) for entry in report.get('Results', []) if entry.get('Class') in ('os-pkgs', 'lang-pkgs'))
           if not packages:
               raise SystemExit('Final image scan evaluated zero packages; not a clean result')
-          print(f"{os.environ['TARGET']}: evaluated packages={packages}; zero vulnerabilities across all severities")
+          print(f"{os.environ['TARGET']}: evaluated packages={packages}; vulnerabilities={len(findings)} across all severities")
+          if findings or int(os.environ['SCAN_STATUS']):
+              raise SystemExit('Final image vulnerability gate failed; sanitized findings are listed above')
           PY
             rm -f "$RUNNER_TEMP/$target-image.tar" "$RUNNER_TEMP/$target-vulnerabilities.json"
           done
+          exit "$gate_status"
       - name: Remove final image scan material
         if: always()
         run: |
