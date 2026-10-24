@@ -16,6 +16,7 @@
 - Encode localized SMTP Subjects with folded RFC2047 and UTF-8 bodies with quoted-printable for seven-bit relays; preserve stable Message-ID, cancellation, CRLF denial and ambiguous-outcome handling. Recovery regressions decode MIME rather than inspect encoded wire text.
 - Expose sorted event-specific template variables and typed, MFA/write-authorized public/internal draft previews through the real validator/renderer with deterministic nonsecret samples; preview never publishes, versions or audits, and accepts no arbitrary example inputs.
 - Permit original-actor SUPPORT session-command recovery under the persisted action's current mutation permission and fresh MFA, without global audit permission; GET stays nondispatching, explicit resume stays original-actor/current-permission/Origin/CSRF gated and requires authoritative absence.
+- Replace the obsolete plaintext CI Kafka fixture with an isolated, digest-pinned TLS/SCRAM broker, ephemeral CA and masked random credentials; provision exact retained-v1 and current-v2 topics and export all required TEST_KAFKA_* inputs so real reseek, cancellation/handoff and ambiguous-publication race regressions execute. Teardown removes only this fixture's uniquely owned container and temporary certificates; application TLS and runtime behavior are unchanged.
 - New regressions are authored for parent integration verification; no new passing test/runtime/provider claim is made by this change entry.
 
 ## 2026-10-23 — platform remediation
