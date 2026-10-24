@@ -135,7 +135,7 @@ func validCommandResult(command Command, result *internalhttpv2.CommandResult) b
 }
 
 func (s *Service) commandStatus(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.Client.Authenticate(w, r, "audit:read", true); !ok {
+	if !s.authenticateCommandLookup(w, r) {
 		return
 	}
 	id, ok := pathUUID(w, r, "invalid_command_id")
@@ -159,7 +159,7 @@ func (s *Service) commandStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) commandResume(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.Client.Authenticate(w, r, "audit:read", true); !ok {
+	if !s.authenticateCommandLookup(w, r) {
 		return
 	}
 	id, ok := pathUUID(w, r, "invalid_command_id")
@@ -179,14 +179,6 @@ func (s *Service) commandResume(w http.ResponseWriter, r *http.Request) {
 		platform.Error(w, 503, "audit_unavailable")
 		return
 	}
-	actor, ok := s.Client.Authenticate(w, r, commandPermission(command.Action), true)
-	if !ok {
-		return
-	}
-	if actor.UserID != command.ActorID {
-		platform.Error(w, 403, "command_actor_mismatch")
-		return
-	}
 	command, ok = s.recoverCommand(w, r, command, true)
 	if !ok {
 		return
@@ -195,10 +187,30 @@ func (s *Service) commandResume(w http.ResponseWriter, r *http.Request) {
 }
 
 func commandPermission(action string) string {
-	if action == "revoke-sessions" {
+	switch action {
+	case "revoke-sessions":
 		return "users:sessions:revoke"
+	case "ban", "unban":
+		return "users:write"
+	default:
+		return ""
 	}
-	return "users:write"
+}
+
+func (s *Service) authenticateCommandLookup(w http.ResponseWriter, r *http.Request) bool {
+	actor, ok := s.Client.Authenticate(w, r, "", true)
+	if !ok {
+		return false
+	}
+	// Before revealing even absence, require a current command permission.
+	// The persisted action and actor are checked separately by recoverCommand.
+	for _, permission := range actor.Permissions {
+		if permission == "users:write" || permission == "users:sessions:revoke" {
+			return true
+		}
+	}
+	platform.Error(w, 403, "permission_denied")
+	return false
 }
 
 func (s *Service) dispatchCommand(r *http.Request, command Command) Command {
@@ -231,12 +243,31 @@ func (s *Service) saveCommandOutcome(command Command, status string, result json
 }
 
 func (s *Service) recoverCommand(w http.ResponseWriter, r *http.Request, command Command, allowResume bool) (Command, bool) {
+	permission := commandPermission(command.Action)
+	if permission == "" {
+		platform.Error(w, 403, "permission_denied")
+		return command, false
+	}
+	actor, ok := s.Client.Authenticate(w, r, permission, true)
+	if !ok {
+		return command, false
+	}
+	if actor.UserID != command.ActorID {
+		platform.Error(w, 403, "command_actor_mismatch")
+		return command, false
+	}
 	if command.Status != "requested" && command.Status != "unknown" {
 		return command, true
 	}
 	status, raw, callErr := s.Client.Call(r.Context(), "GET", s.Config.IdentityURL+"/internal/v2/admin/commands/"+command.ID, nil, r)
 	if callErr != nil {
 		return command, true
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// Current authority may have changed after frontdoor introspection.
+		// Do not expose the journal or redispatch when the owner denies lookup.
+		platform.Error(w, status, "access_denied")
+		return command, false
 	}
 	if status == 200 {
 		var owner internalhttpv2.CommandStatus
@@ -262,14 +293,15 @@ func (s *Service) recoverCommand(w http.ResponseWriter, r *http.Request, command
 	if !allowResume || r.Method != http.MethodPost {
 		return command, true
 	}
-	// Only authoritative absence allows resubmission, and a status reader is
-	// not implicitly allowed to perform the original privileged mutation.
-	actor, ok := s.Client.Authenticate(w, r, commandPermission(command.Action), true)
+	// Only authoritative absence allows resubmission. Recheck live mutation
+	// authorization and original browser Origin/CSRF immediately before dispatch.
+	actor, ok = s.Client.Authenticate(w, r, permission, true)
 	if !ok {
 		return command, false
 	}
 	if actor.UserID != command.ActorID {
-		return command, true
+		platform.Error(w, 403, "command_actor_mismatch")
+		return command, false
 	}
 	return s.dispatchCommand(r, command), true
 }

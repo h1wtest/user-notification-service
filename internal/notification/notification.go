@@ -144,6 +144,7 @@ func (s *Service) Routes(m *http.ServeMux) {
 	m.HandleFunc("POST /internal/v1/deliveries/{id}/replay", s.replay)
 	m.HandleFunc("GET /internal/v2/templates", s.templates)
 	m.HandleFunc("PUT /internal/v2/templates/{event_type}", s.putTemplate)
+	m.HandleFunc("POST /internal/v2/templates/{event_type}/preview", s.previewTemplate)
 	q := platform.QuarantineAPI{DB: s.DB, Config: s.Config, Client: s.Client, Apply: s.Apply, ApplyV2: s.ApplyV2, Owner: "notification"}
 	m.HandleFunc("GET /internal/v1/quarantine", q.List)
 	m.HandleFunc("POST /internal/v1/quarantine/{id}/replay", q.Replay)

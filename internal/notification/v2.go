@@ -249,6 +249,15 @@ func (s *Service) planIntents(ctx context.Context, eventID, eventType string, p 
 	}
 	channels := []string{"email"}
 	var policy recipientPolicy
+	// Reset commands target an existing account, unlike first verification.
+	// Resolve only the locale: transactional mail bypasses optional switches.
+	if eventType == "notification.password_reset" && p.Locale == "" {
+		policy, err = s.recipient(ctx, p.UserID)
+		if err != nil {
+			return nil, err
+		}
+		p.Locale = policy.Locale
+	}
 	if p.Category != "transactional" {
 		policy, err = s.recipient(ctx, p.UserID)
 		if err != nil {

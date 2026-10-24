@@ -1,7 +1,6 @@
 package notification
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -12,6 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"io"
+	"mime"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
@@ -136,14 +137,14 @@ func (s *Service) Work(ctx context.Context) error {
 }
 func (s *Service) sendSMTP(ctx context.Context, j Job, b Body) (bool, string, error) {
 	from, err := mail.ParseAddress(s.Config.SMTPFrom)
-	if err != nil {
-		return true, "invalid_sender", err
+	if err != nil || !asciiSMTPHeader(from.Address) {
+		return true, "invalid_sender", errors.New("invalid SMTP sender")
 	}
 	to, err := mail.ParseAddress(b.To)
-	if err != nil {
-		return true, "invalid_recipient", err
+	if err != nil || !asciiSMTPHeader(to.Address) {
+		return true, "invalid_recipient", errors.New("invalid SMTP recipient")
 	}
-	if strings.ContainsAny(b.Subject, "\r\n") || strings.ContainsAny(j.MessageID, "\r\n") {
+	if strings.ContainsAny(b.Subject, "\r\n") || strings.ContainsAny(j.MessageID, "\r\n") || !asciiSMTPHeader(j.MessageID) {
 		return true, "invalid_headers", errors.New("invalid headers")
 	}
 	address := net.JoinHostPort(s.Config.SMTPHost, s.Config.SMTPPort)
@@ -184,8 +185,19 @@ func (s *Service) sendSMTP(ctx context.Context, j Job, b Body) (bool, string, er
 	if err != nil {
 		return smtpError(err, false)
 	}
-	message := "From: " + from.String() + "\r\nTo: " + to.String() + "\r\nSubject: " + b.Subject + "\r\nMessage-ID: " + j.MessageID + "\r\nDate: " + time.Now().UTC().Format(time.RFC1123Z) + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" + strings.ReplaceAll(strings.ReplaceAll(b.Text, "\r\n", "\n"), "\n", "\r\n")
-	if _, err = io.Copy(writer, bufio.NewReader(strings.NewReader(message))); err != nil {
+	subject := mime.BEncoding.Encode("UTF-8", b.Subject)
+	if strings.HasPrefix(subject, "=?UTF-8?b?") {
+		subject = strings.ReplaceAll(subject, " ", "\r\n ")
+	}
+	message := "From: " + from.String() + "\r\nTo: " + to.String() + "\r\nSubject: " + subject + "\r\nMessage-ID: " + j.MessageID + "\r\nDate: " + time.Now().UTC().Format(time.RFC1123Z) + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+	if _, err = io.WriteString(writer, message); err != nil {
+		return smtpError(err, true)
+	}
+	encoded := quotedprintable.NewWriter(writer)
+	if _, err = io.WriteString(encoded, b.Text); err != nil {
+		return smtpError(err, true)
+	}
+	if err = encoded.Close(); err != nil {
 		return smtpError(err, true)
 	}
 	if err = writer.Close(); err != nil {
@@ -193,6 +205,14 @@ func (s *Service) sendSMTP(ctx context.Context, j Job, b Body) (bool, string, er
 	}
 	_ = client.Quit()
 	return false, "", nil
+}
+func asciiSMTPHeader(value string) bool {
+	for i := range len(value) {
+		if value[i] < 32 || value[i] > 126 {
+			return false
+		}
+	}
+	return true
 }
 func smtpError(err error, ambiguous bool) (bool, string, error) {
 	var protocol *textproto.Error

@@ -65,6 +65,7 @@ func (s *Service) Routes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/v1/admin/deliveries/{id}/replay", s.replay)
 	m.HandleFunc("GET /api/v1/admin/templates", s.templates)
 	m.HandleFunc("PUT /api/v1/admin/templates/{event_type}", s.publishTemplate)
+	m.HandleFunc("POST /api/v1/admin/templates/{event_type}/preview", s.previewTemplate)
 	m.HandleFunc("GET /api/v1/admin/quarantine", s.quarantine)
 	m.HandleFunc("POST /api/v1/admin/quarantine/{id}/replay", s.quarantineReplay)
 }
@@ -264,6 +265,30 @@ func (s *Service) publishTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	var result internalhttpv2.TemplateRevision
 	if json.Unmarshal(raw, &result) != nil || result.EventType != eventType {
+		platform.Error(w, 503, "invalid_dependency_response")
+		return
+	}
+	platform.JSON(w, 200, result)
+}
+func (s *Service) previewTemplate(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.Client.Authenticate(w, r, "notifications:templates:write", true); !ok {
+		return
+	}
+	eventType := r.PathValue("event_type")
+	if eventType == "" || len(eventType) > 100 {
+		platform.Error(w, 400, "invalid_event_type")
+		return
+	}
+	var input internalhttpv2.TemplatePreviewRequest
+	if !platform.Decode(w, r, &input) {
+		return
+	}
+	status, raw, err := s.Client.Call(r.Context(), "POST", s.Config.NotificationURL+"/internal/v2/templates/"+url.PathEscape(eventType)+"/preview", input, r)
+	if !dependencyStatus(w, status, err, "notification_unavailable", raw) {
+		return
+	}
+	var result internalhttpv2.TemplatePreviewResponse
+	if json.Unmarshal(raw, &result) != nil {
 		platform.Error(w, 503, "invalid_dependency_response")
 		return
 	}

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/mail"
 	"net/textproto"
 	"net/url"
 	"strings"
@@ -185,16 +184,12 @@ func TestVerificationRecoveryV1AndV2PersistAndSendFreshBrowserURL(t *testing.T) 
 			}
 			select {
 			case raw := <-messages:
-				message, err := mail.ReadMessage(strings.NewReader(string(raw)))
-				if err != nil {
-					t.Fatal(err)
+				subject, text, messageID := decodeSMTPMessage(t, raw)
+				assertVerificationRecoveryEmail(t, text, user)
+				if subject != body.Subject || messageID != job.MessageID {
+					t.Fatal("MIME lost localized subject or stable Message-ID")
 				}
-				text, err := io.ReadAll(message.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-				assertVerificationRecoveryEmail(t, string(text), user)
-				if test.locale == "ru" && !strings.Contains(string(text), "Подтверд") {
+				if test.locale == "ru" && !strings.Contains(text, "Подтверд") {
 					t.Fatal("RU verification email lost its localized recovery instructions")
 				}
 			case <-ctx.Done():

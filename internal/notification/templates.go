@@ -281,5 +281,68 @@ func (s *Service) putTemplate(w http.ResponseWriter, r *http.Request) {
 	platform.JSON(w, 200, templateWire(v))
 }
 func templateWire(v Template) businessv1.TemplateRevision {
-	return businessv1.TemplateRevision{EventType: v.EventType, Version: v.Version, Locales: businessv1.TemplateLocales{En: v.Locales["en"], Ru: v.Locales["ru"]}}
+	variables := append([]string{}, templateVariables[v.EventType]...)
+	sort.Strings(variables)
+	return businessv1.TemplateRevision{EventType: v.EventType, Version: v.Version, Locales: businessv1.TemplateLocales{En: v.Locales["en"], Ru: v.Locales["ru"]}, Variables: variables}
+}
+
+func (s *Service) previewTemplate(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.admin(w, r, "notifications:templates:write"); !ok {
+		return
+	}
+	var in businessv1.TemplatePreviewRequest
+	if !platform.Decode(w, r, &in) {
+		return
+	}
+	t := Template{EventType: r.PathValue("event_type"), Locales: map[string]TemplateText{"en": in.Locales.En, "ru": in.Locales.Ru}}
+	if err := validateTemplate(t); err != nil {
+		platform.Error(w, 400, err.Error())
+		return
+	}
+	vars, err := s.previewVariables(t.EventType)
+	if err != nil {
+		platform.Error(w, 503, "preview_configuration_unavailable")
+		return
+	}
+	locales := make(map[string]TemplateText, 2)
+	for _, locale := range []string{"en", "ru"} {
+		subject, body, err := renderTemplate(t, locale, vars)
+		if err != nil {
+			platform.Error(w, 400, err.Error())
+			return
+		}
+		locales[locale] = TemplateText{Subject: subject, Body: body}
+	}
+	platform.JSON(w, 200, businessv1.TemplatePreviewResponse{Locales: businessv1.TemplateLocales{En: locales["en"], Ru: locales["ru"]}})
+}
+
+// Samples are code-owned and never read an account, challenge or provider.
+func (s *Service) previewVariables(event string) (map[string]string, error) {
+	samples := map[string]string{
+		"code": "654321", "expires_at": "2030-01-02T03:04:05Z", "occurred_at": "2030-01-01T03:04:05Z",
+		"device_name": "Example <device> & browser", "ip_address": "192.0.2.1",
+		"order_id": "00000000-0000-4000-8000-000000000001", "subscription_id": "00000000-0000-4000-8000-000000000002", "payout_id": "00000000-0000-4000-8000-000000000003",
+		"amount": "12.34", "currency": "USD", "period_end": "2030-02-01T03:04:05Z", "days": "3",
+		"reason": "Example reason", "state": "APPROVED", "status": "ready", "message": "Example <message> & details",
+	}
+	vars := make(map[string]string, len(templateVariables[event]))
+	for _, name := range templateVariables[event] {
+		if name == "verification_url" || name == "reset_url" {
+			u, err := url.Parse(s.Config.Origin)
+			if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(s.Config.Origin, "\r\n") {
+				return nil, errUnsafeURL
+			}
+			vars[name] = strings.TrimRight(s.Config.Origin, "/") + "/?user_id=00000000-0000-4000-8000-000000000001"
+			if name == "reset_url" {
+				vars[name] = strings.TrimRight(s.Config.Origin, "/") + "/?token=example-not-a-valid-authentication-token"
+			}
+			continue
+		}
+		value, ok := samples[name]
+		if !ok {
+			return nil, errUnknownVariable
+		}
+		vars[name] = value
+	}
+	return vars, nil
 }
